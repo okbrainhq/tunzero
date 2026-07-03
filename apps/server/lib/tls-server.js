@@ -184,7 +184,7 @@ function createTLSServer(connectionPool, options = {}) {
 
         // All other frames: dedup and route
         const targetPool = certBoundDomains ? socket._okproxySession?.pool : connectionPool;
-        if (targetPool) targetPool.onFrame(frame);
+        if (targetPool) targetPool.onFrame(frame, socket);
       },
       (err) => {
         console.error('Protocol error:', err.message);

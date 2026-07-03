@@ -10,6 +10,8 @@ const MAX_WS_BUFFER_SIZE = 16 * 1024 * 1024;
 const DEFAULT_HTTP_KEEPALIVE_TIMEOUT = 60 * 60 * 1000;
 const HTTP_HEADERS_TIMEOUT_BUFFER = 5000;
 const LOG_VALUE_MAX_LENGTH = 200;
+const SINGLE_FLOW_MEDIA_EXTENSION_RE = /\.(?:aac|aif|aiff|flac|m4a|m4b|mp3|oga|ogg|opus|wav|weba|m4v|mkv|mov|mp4|webm)(?:$|[?#])/i;
+const SINGLE_FLOW_REQUEST_CONTENT_TYPE_RE = /^(?:multipart\/form-data|audio\/|video\/|application\/octet-stream\b)/i;
 
 const STATUS_TEXTS = {
   400: 'Bad Request',
@@ -76,6 +78,44 @@ function truncateForLog(value, maxLength = LOG_VALUE_MAX_LENGTH) {
   return str.length > maxLength ? `${str.slice(0, maxLength)}…` : str;
 }
 
+function getRequestPathname(reqUrl) {
+  try {
+    return new URL(reqUrl || '/', 'http://okproxy.local').pathname || '/';
+  } catch {
+    return String(reqUrl || '/').split('?')[0] || '/';
+  }
+}
+
+function shouldUseSingleFlow(reqUrl, headers = {}, method = 'GET') {
+  const pathname = getRequestPathname(reqUrl);
+  if (SINGLE_FLOW_MEDIA_EXTENSION_RE.test(pathname)) return true;
+
+  const accept = String(headers.accept || '');
+  if (/\b(?:audio|video)\//i.test(accept)) return true;
+
+  const fetchDest = String(headers['sec-fetch-dest'] || '');
+  if (/^(?:audio|video)$/i.test(fetchDest)) return true;
+
+  // Browser media players commonly use Range requests. Treat them as heavy
+  // single-flow candidates so they do not duplicate across every multipath lane.
+  if (headers.range) return true;
+
+  const requestMethod = String(method || 'GET').toUpperCase();
+  const hasRequestBody = !['GET', 'HEAD', 'OPTIONS'].includes(requestMethod);
+  if (hasRequestBody) {
+    const contentType = String(headers['content-type'] || '');
+    if (SINGLE_FLOW_REQUEST_CONTENT_TYPE_RE.test(contentType)) return true;
+
+    // Resumable/chunked upload protocols advertise these headers even when
+    // the request content type is generic.
+    if (headers['content-range'] || headers['upload-length'] || headers['upload-offset'] || headers['tus-resumable']) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
 function createTimingLog(scope, details = {}, startedAt = process.hrtime.bigint()) {
   const marks = new Map([['browser_accepted', 0]]);
   let logged = false;
@@ -127,20 +167,24 @@ function waitForDrain(target, callback) {
   target.once('error', done);
 }
 
-function waitForPoolDrain(pool, callback) {
-  if (pool && typeof pool.onceDrain === 'function') {
+function waitForPoolDrain(pool, callback, streamId = null) {
+  if (streamId !== null && pool && typeof pool.onceDrainForStream === 'function') {
+    pool.onceDrainForStream(streamId, callback);
+  } else if (pool && typeof pool.onceDrain === 'function') {
     pool.onceDrain(callback);
   } else {
     process.nextTick(callback);
   }
 }
 
-function pausePool(pool) {
-  if (pool && typeof pool.pause === 'function') pool.pause();
+function pausePool(pool, streamId = null) {
+  if (streamId !== null && pool && typeof pool.pauseStream === 'function') pool.pauseStream(streamId);
+  else if (pool && typeof pool.pause === 'function') pool.pause();
 }
 
-function resumePool(pool) {
-  if (pool && typeof pool.resume === 'function') pool.resume();
+function resumePool(pool, streamId = null) {
+  if (streamId !== null && pool && typeof pool.resumeStream === 'function') pool.resumeStream(streamId);
+  else if (pool && typeof pool.resume === 'function') pool.resume();
 }
 
 function buildWebSocketFrame(opcode, payload) {
@@ -305,12 +349,17 @@ function createHTTPServer(connectionPool, tcpServer, options = {}) {
 
     const clientIp = req.socket.remoteAddress || '127.0.0.1';
     const publicProto = req.headers['x-forwarded-proto'] || (req.socket.encrypted ? 'https' : 'http');
+    const singleFlow = shouldUseSingleFlow(req.url, req.headers, req.method);
+    if (typeof selectedPool.setStreamMode === 'function') {
+      selectedPool.setStreamMode(streamId, { singleFlow });
+    }
     const timing = createTimingLog('server-http', {
       stream: streamId,
       method: req.method,
       path: req.url,
       host: req.headers.host || '',
-      client: clientIp
+      client: clientIp,
+      tunnelMode: singleFlow ? 'single-flow' : 'multipath'
     }, acceptedAt);
     let bodySize = 0;
     let cleanedUp = false;
@@ -325,7 +374,9 @@ function createHTTPServer(connectionPool, tcpServer, options = {}) {
       clientSerial: route.session?.serial,
       publicHost: route.domain || req.headers.host,
       publicProto,
-      remoteAddress: clientIp
+      remoteAddress: clientIp,
+      tunnelMode: singleFlow ? 'single-flow' : 'multipath',
+      tunnel: { singleFlow }
     })));
     timing.mark('tunnel_headers_sent');
 
@@ -335,7 +386,7 @@ function createHTTPServer(connectionPool, tcpServer, options = {}) {
       waitForPoolDrain(selectedPool, () => {
         requestBackpressured = false;
         if (!cleanedUp) req.resume();
-      });
+      }, streamId);
     }
 
     let streamTimer = null;
@@ -394,7 +445,7 @@ function createHTTPServer(connectionPool, tcpServer, options = {}) {
         waitForPoolDrain(selectedPool, () => {
           requestBackpressured = false;
           if (!cleanedUp) req.resume();
-        });
+        }, streamId);
       }
     });
 
@@ -415,7 +466,7 @@ function createHTTPServer(connectionPool, tcpServer, options = {}) {
       if (cleanedUp) return;
       cleanedUp = true;
       if (requestBackpressured) req.resume();
-      if (responseBackpressured) resumePool(selectedPool);
+      if (responseBackpressured) resumePool(selectedPool, streamId);
       clearTimeout(streamTimer);
       selectedPool.unregisterStream(streamId);
       releaseStream(route, streamId);
@@ -470,10 +521,10 @@ function createHTTPServer(connectionPool, tcpServer, options = {}) {
           }
           if (!res.write(frame.payload) && !responseBackpressured) {
             responseBackpressured = true;
-            pausePool(selectedPool);
+            pausePool(selectedPool, streamId);
             waitForDrain(res, () => {
               responseBackpressured = false;
-              if (!cleanedUp) resumePool(selectedPool);
+              if (!cleanedUp) resumePool(selectedPool, streamId);
             });
           }
           resetStreamTimeout();
@@ -554,6 +605,11 @@ function createHTTPServer(connectionPool, tcpServer, options = {}) {
       sock.setMaxListeners(maxStreams + maxWebSocketStreams + 10);
     }
 
+    const singleFlow = shouldUseSingleFlow(req.url, req.headers, req.method);
+    if (typeof selectedPool.setStreamMode === 'function') {
+      selectedPool.setStreamMode(streamId, { singleFlow });
+    }
+
     const upgradePayload = JSON.stringify({
       protocol: 'websocket',
       method: req.method,
@@ -562,7 +618,9 @@ function createHTTPServer(connectionPool, tcpServer, options = {}) {
       clientSerial: route.session?.serial,
       publicHost: route.domain || req.headers.host,
       publicProto: req.headers['x-forwarded-proto'] || (req.socket.encrypted ? 'https' : 'http'),
-      remoteAddress: req.socket.remoteAddress || '127.0.0.1'
+      remoteAddress: req.socket.remoteAddress || '127.0.0.1',
+      tunnelMode: singleFlow ? 'single-flow' : 'multipath',
+      tunnel: { singleFlow }
     });
 
     selectedPool.send(encodeFrame(streamId, FrameType.UPGRADE, upgradePayload));
@@ -572,6 +630,7 @@ function createHTTPServer(connectionPool, tcpServer, options = {}) {
     let upgradeResponseReceived = false;
     let cleanupCalled = false;
     let closeFramePending = false;
+    let browserBackpressured = false;
     const WS_IDLE_TIMEOUT = 300000;
     let idleTimer = null;
 
@@ -593,6 +652,7 @@ function createHTTPServer(connectionPool, tcpServer, options = {}) {
       if (cleanupCalled) return;
       cleanupCalled = true;
       if (idleTimer) clearTimeout(idleTimer);
+      if (browserBackpressured) resumePool(selectedPool, streamId);
       webSockets.delete(streamId);
       selectedPool.unregisterStream(streamId);
       releaseStream(route, streamId);
@@ -635,10 +695,18 @@ function createHTTPServer(connectionPool, tcpServer, options = {}) {
             targetToBrowserBuffer = remaining;
             const isCloseFrame = opcode === 0x08;
             if (isCloseFrame) closeFramePending = true;
-            socket.write(completeFrame, (err) => {
+            const canWrite = socket.write(completeFrame, (err) => {
               if (err) cleanup();
               else if (isCloseFrame) cleanup();
             });
+            if (!canWrite && !browserBackpressured && !isCloseFrame) {
+              browserBackpressured = true;
+              pausePool(selectedPool, streamId);
+              waitForDrain(socket, () => {
+                browserBackpressured = false;
+                if (!cleanupCalled) resumePool(selectedPool, streamId);
+              });
+            }
             if (isCloseFrame) break;
           }
           if (targetToBrowserBuffer.length > MAX_WS_BUFFER_SIZE) {
@@ -663,8 +731,13 @@ function createHTTPServer(connectionPool, tcpServer, options = {}) {
     function sendLargeFrameChunk() {
       while (pendingOffset < pendingLargeFrame.length) {
         const end = Math.min(pendingOffset + MAX_FRAME_SIZE, pendingLargeFrame.length);
-        selectedPool.send(encodeFrame(streamId, FrameType.DATA, pendingLargeFrame.subarray(pendingOffset, end)));
+        const canWrite = selectedPool.send(encodeFrame(streamId, FrameType.DATA, pendingLargeFrame.subarray(pendingOffset, end)));
         pendingOffset = end;
+        if (!canWrite) {
+          socket.pause();
+          waitForPoolDrain(selectedPool, sendLargeFrameChunk, streamId);
+          return;
+        }
       }
       pendingLargeFrame = null;
       pendingOffset = 0;
@@ -686,7 +759,12 @@ function createHTTPServer(connectionPool, tcpServer, options = {}) {
         const rawFrame = Buffer.from(wsBuffer.subarray(0, frameSize));
         wsBuffer = remaining;
         if (rawFrame.length <= MAX_FRAME_SIZE) {
-          selectedPool.send(encodeFrame(streamId, FrameType.DATA, rawFrame));
+          if (!selectedPool.send(encodeFrame(streamId, FrameType.DATA, rawFrame))) {
+            socket.pause();
+            waitForPoolDrain(selectedPool, () => {
+              if (!cleanupCalled) socket.resume();
+            }, streamId);
+          }
         } else {
           pendingLargeFrame = rawFrame;
           pendingOffset = 0;
@@ -735,4 +813,10 @@ function createHTTPServer(connectionPool, tcpServer, options = {}) {
   return server;
 }
 
-module.exports = { createHTTPServer, isWebSocketUpgrade, buildWebSocketFrame, parseWebSocketFrame };
+module.exports = {
+  createHTTPServer,
+  isWebSocketUpgrade,
+  buildWebSocketFrame,
+  parseWebSocketFrame,
+  shouldUseSingleFlow
+};

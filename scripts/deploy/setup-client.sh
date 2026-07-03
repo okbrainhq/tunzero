@@ -3,6 +3,7 @@
 # setup-client.sh
 # Purpose: Orchestrates the setup of a tunnel client on a remote MacBook.
 # Usage: ./scripts/deploy/setup-client.sh [USER@HOST] [--upload-certs] [--cert-dir <dir>] [--client-name <name>]
+# Optional .deploy.client: PARALLEL_SOCKETS=4 (default)
 
 set -e
 
@@ -41,6 +42,7 @@ UPLOAD_CERTS=false
 CLIENT_NAME=${CLIENT_NAME:-default}
 CLIENT_CERT_DIR=${CLIENT_CERT_DIR:-$PROJECT_ROOT/.certs}
 REMOTE_CERT_DIR=${REMOTE_CERT_DIR:-}
+PARALLEL_SOCKETS=${PARALLEL_SOCKETS:-4}
 
 while [ $# -gt 0 ]; do
     arg="$1"
@@ -88,11 +90,17 @@ if [ -z "$HOST" ]; then
     exit 1
 fi
 
+if ! [[ "$PARALLEL_SOCKETS" =~ ^[0-9]+$ ]] || [ "$PARALLEL_SOCKETS" -lt 1 ] || [ "$PARALLEL_SOCKETS" -gt 32 ]; then
+    echo "Error: PARALLEL_SOCKETS must be an integer from 1 to 32."
+    exit 1
+fi
+
 echo "Setting up OKProxy Client on $HOST..."
 echo "Server: $SERVER_HOST"
 echo "Target: $TARGET_HOST"
 echo "Repository: $REPO_URL"
 echo "Client name: $CLIENT_NAME"
+echo "Parallel sockets per interface: $PARALLEL_SOCKETS"
 echo "Local cert dir: $CLIENT_CERT_DIR"
 
 # Build SSH/SCP port options
@@ -173,7 +181,8 @@ ESCAPED_TARGET_HOST=$(printf '%q' "$TARGET_HOST")
 ESCAPED_REPO_URL=$(printf '%q' "$REPO_URL")
 ESCAPED_CLIENT_NAME=$(printf '%q' "$CLIENT_NAME")
 ESCAPED_REMOTE_CERT_DIR=$(printf '%q' "$REMOTE_CERT_DIR")
-ssh $SSH_OPTS "$HOST" "chmod +x ~/setup-client-remote.sh && ~/setup-client-remote.sh $ESCAPED_SERVER_HOST $ESCAPED_TARGET_HOST $ESCAPED_REPO_URL $ESCAPED_CLIENT_NAME $ESCAPED_REMOTE_CERT_DIR"
+ESCAPED_PARALLEL_SOCKETS=$(printf '%q' "$PARALLEL_SOCKETS")
+ssh $SSH_OPTS "$HOST" "chmod +x ~/setup-client-remote.sh && ~/setup-client-remote.sh $ESCAPED_SERVER_HOST $ESCAPED_TARGET_HOST $ESCAPED_REPO_URL $ESCAPED_CLIENT_NAME $ESCAPED_REMOTE_CERT_DIR $ESCAPED_PARALLEL_SOCKETS"
 
 if [ "$CLIENT_NAME" = "default" ]; then
     LAUNCH_LABEL="com.okproxy.client"

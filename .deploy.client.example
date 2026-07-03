@@ -22,6 +22,11 @@ CLIENT_CERT_DIR=./.certs/client-1
 # Defaults to ~/.okproxy/certs/$CLIENT_NAME (or ~/.okproxy/certs for CLIENT_NAME=default)
 # REMOTE_CERT_DIR=~/.okproxy/certs/client-1
 
+# Optional: number of parallel tunnel sockets per network interface.
+# Use >1 to keep normal traffic responsive during large audio uploads/downloads.
+# Default used by deploy scripts: 4
+# PARALLEL_SOCKETS=4
+
 # Optional: default deployment host (USER@HOST)
 # DEPLOY_HOST=user@client-machine.local
 

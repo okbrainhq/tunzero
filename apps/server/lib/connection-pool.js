@@ -1,5 +1,5 @@
-// ConnectionPool — Server-side multipath connection manager
-// Accepts multiple TLS connections from the same client, dedups inbound, broadcasts outbound
+// ConnectionPool — Server-side multipath/parallel connection manager
+// Accepts multiple TLS connections from the same client, dedups inbound, and pins each outbound stream to one connection
 
 const { encodeFrame, FrameType, CONTROL_FRAME_TYPES, DedupWindow } = require('../../../packages/frame-protocol');
 
@@ -9,13 +9,17 @@ const SEQ_RESET_THRESHOLD = 0xFFFFFF0F; // 2^32 - 1,000,000
 const STREAM_CLEANUP_GRACE_MS = 60000;
 
 class ConnectionPool {
-  constructor() {
+  constructor(options = {}) {
     this.connections = new Map(); // `${clientSerial}:${interfaceName}` -> socket
     this.dedupWindows = new Map(); // streamId -> DedupWindow
     this.seqCounters = new Map(); // streamId -> nextSeqNo
     this.cleanupTimers = new Map(); // streamId -> setTimeout handle (TTL cleanup)
     this.activeStreams = new Map(); // streamId -> { frameHandler, errorHandler }
-    this.clientSerial = null; // Active authenticated client identity
+    this.clientSerial = options.clientSerial ? String(options.clientSerial) : null; // Active authenticated client identity
+    this.streamOutboundConnections = new Map(); // streamId -> connection key (server -> client single-flow)
+    this.streamInboundConnections = new Map(); // streamId -> Set<socket> (client -> server)
+    this.streamOptions = new Map(); // streamId -> { singleFlow }
+    this.roundRobinCursor = 0;
   }
 
   /**
@@ -34,6 +38,7 @@ class ConnectionPool {
     // Replace existing connection for this interface
     if (this.connections.has(key)) {
       const old = this.connections.get(key);
+      this._forgetConnection(key, old);
       try { old.destroy(); } catch {}
     }
     this.connections.set(key, socket);
@@ -44,12 +49,19 @@ class ConnectionPool {
    * Remove a connection
    */
   remove(socket) {
+    let removedKey = null;
     for (const [name, s] of this.connections) {
       if (s === socket) {
+        removedKey = name;
         this.connections.delete(name);
         break;
       }
     }
+
+    if (removedKey) {
+      this._forgetConnection(removedKey, socket);
+    }
+
     // If no connections left, clean up all streams
     if (this.connections.size === 0) {
       this.clientSerial = null;
@@ -66,13 +78,14 @@ class ConnectionPool {
    * Handles dedup and routes to stream handlers.
    * @returns {'new' | 'duplicate'}
    */
-  onFrame(frame) {
+  onFrame(frame, socket = null) {
     // Control frames are handled per-connection, skip
     if (frame.streamId === 0 && CONTROL_FRAME_TYPES.has(frame.type)) {
       return 'new';
     }
 
     const streamId = frame.streamId;
+    if (socket) this._markInboundConnection(streamId, socket);
 
     // Stream lifecycle — FIN/ERROR: dedup before delivery
     if (frame.type === FrameType.FIN || frame.type === FrameType.ERROR) {
@@ -137,37 +150,90 @@ class ConnectionPool {
   }
 
   /**
-   * Send a frame to the client — assigns seqNo and duplicates to all connections.
+   * Send a frame to the client — assigns seqNo. Normal streams keep the
+   * traditional multipath behavior (broadcast to every tunnel connection).
+   * Streams marked singleFlow are pinned to one connection.
    */
   send(frameBuf) {
     const type = frameBuf.readUInt8(4);
 
-    if (!CONTROL_FRAME_TYPES.has(type)) {
-      const streamId = frameBuf.readUInt32BE(0);
-      let seqNo = (this.seqCounters.get(streamId) || 0) + 1;
-
-      if (seqNo > SEQ_RESET_THRESHOLD) {
-        this._sendResetSeq(streamId);
-        seqNo = 0;
-      }
-
-      this.seqCounters.set(streamId, seqNo);
-      frameBuf.writeUInt32BE(seqNo, 5);
-
-      // Outbound ERROR means the server is aborting the stream — both
-      // directions are done. Schedule TTL cleanup.
-      // (Outbound FIN is just end-of-request-body; the client's response
-      // may still be active, so no cleanup here — it's scheduled when
-      // the server receives the client's inbound FIN/ERROR in onFrame().)
-      if (type === FrameType.ERROR) {
-        this._scheduleStreamCleanup(streamId);
-      }
+    if (CONTROL_FRAME_TYPES.has(type)) {
+      return this._writeToConnections(frameBuf, this._allLiveConnections());
     }
 
+    const streamId = frameBuf.readUInt32BE(0);
+    let seqNo = (this.seqCounters.get(streamId) || 0) + 1;
+
+    if (seqNo > SEQ_RESET_THRESHOLD) {
+      this._sendResetSeq(streamId);
+      seqNo = 0;
+    }
+
+    this.seqCounters.set(streamId, seqNo);
+    frameBuf.writeUInt32BE(seqNo, 5);
+
+    // Outbound ERROR means the server is aborting the stream — both
+    // directions are done. Schedule TTL cleanup.
+    // (Outbound FIN is just end-of-request-body; the client's response
+    // may still be active, so no cleanup here — it's scheduled when
+    // the server receives the client's inbound FIN/ERROR in onFrame().)
+    if (type === FrameType.ERROR) {
+      this._scheduleStreamCleanup(streamId);
+    }
+
+    const targets = this._isSingleFlowStream(streamId)
+      ? this._selectOutboundConnection(streamId)
+      : this._allLiveConnections();
+
+    return this._writeToConnections(frameBuf, targets);
+  }
+
+  onceDrain(callback) {
+    this._onceDrainOnSockets(this._allLiveConnections().map(([, sock]) => sock), callback);
+  }
+
+  onceDrainForStream(streamId, callback) {
+    const sockets = this._isSingleFlowStream(streamId) ? this._getOutboundSocketsForStream(streamId) : [];
+    this._onceDrainOnSockets(sockets.length > 0 ? sockets : this._allLiveConnections().map(([, sock]) => sock), callback);
+  }
+
+  pause() {
+    for (const sock of this.connections.values()) {
+      if (!sock.destroyed && typeof sock.pause === 'function') sock.pause();
+    }
+  }
+
+  resume() {
+    for (const sock of this.connections.values()) {
+      if (!sock.destroyed && typeof sock.resume === 'function') sock.resume();
+    }
+  }
+
+  pauseStream(streamId) {
+    const sockets = this._getInboundSocketsForStream(streamId);
+    if (sockets.length === 0) return this.pause();
+    for (const sock of sockets) {
+      if (!sock.destroyed && typeof sock.pause === 'function') sock.pause();
+    }
+  }
+
+  resumeStream(streamId) {
+    const sockets = this._getInboundSocketsForStream(streamId);
+    if (sockets.length === 0) return this.resume();
+    for (const sock of sockets) {
+      if (!sock.destroyed && typeof sock.resume === 'function') sock.resume();
+    }
+  }
+
+  _allLiveConnections() {
+    return [...this.connections.entries()].filter(([, sock]) => !sock.destroyed);
+  }
+
+  _writeToConnections(frameBuf, entries) {
     let connected = 0;
     let backpressured = false;
 
-    for (const [name, sock] of this.connections) {
+    for (const [, sock] of entries) {
       if (!sock.destroyed) {
         connected++;
         if (!sock.write(frameBuf)) backpressured = true;
@@ -177,10 +243,88 @@ class ConnectionPool {
     return connected > 0 && !backpressured;
   }
 
-  onceDrain(callback) {
-    const waiting = [...this.connections.values()].filter(sock =>
-      !sock.destroyed && sock.writableNeedDrain
-    );
+  setStreamMode(streamId, options = {}) {
+    const current = this.streamOptions.get(streamId) || {};
+    if (typeof options.singleFlow === 'boolean') {
+      current.singleFlow = options.singleFlow;
+    }
+
+    if (current.singleFlow) {
+      this.streamOptions.set(streamId, current);
+    } else {
+      this.streamOptions.delete(streamId);
+      this.streamOutboundConnections.delete(streamId);
+    }
+  }
+
+  clearStreamMode(streamId) {
+    this.streamOptions.delete(streamId);
+    this.streamOutboundConnections.delete(streamId);
+    this.streamInboundConnections.delete(streamId);
+  }
+
+  _isSingleFlowStream(streamId) {
+    return this.streamOptions.get(streamId)?.singleFlow === true;
+  }
+
+  _selectOutboundConnection(streamId) {
+    const existingKey = this.streamOutboundConnections.get(streamId);
+    const existing = existingKey ? this.connections.get(existingKey) : null;
+    if (existing && !existing.destroyed) return [[existingKey, existing]];
+
+    const live = this._allLiveConnections();
+    if (live.length === 0) return [];
+
+    const loadByKey = new Map();
+    for (const key of this.streamOutboundConnections.values()) {
+      if (this.connections.has(key)) loadByKey.set(key, (loadByKey.get(key) || 0) + 1);
+    }
+
+    let best = null;
+    let bestScore = Infinity;
+    const start = live.length > 0 ? this.roundRobinCursor % live.length : 0;
+
+    for (let i = 0; i < live.length; i++) {
+      const index = (start + i) % live.length;
+      const [key, sock] = live[index];
+      const load = loadByKey.get(key) || 0;
+      const score = load + (sock.writableNeedDrain ? 1000000 : 0);
+      if (score < bestScore) {
+        bestScore = score;
+        best = { key, sock, index };
+      }
+    }
+
+    if (!best) return [];
+    this.roundRobinCursor = (best.index + 1) % live.length;
+    this.streamOutboundConnections.set(streamId, best.key);
+    return [[best.key, best.sock]];
+  }
+
+  _getOutboundSocketsForStream(streamId) {
+    const key = this.streamOutboundConnections.get(streamId);
+    const sock = key ? this.connections.get(key) : null;
+    return sock && !sock.destroyed ? [sock] : [];
+  }
+
+  _markInboundConnection(streamId, socket) {
+    if (socket.destroyed) return;
+    let sockets = this.streamInboundConnections.get(streamId);
+    if (!sockets) {
+      sockets = new Set();
+      this.streamInboundConnections.set(streamId, sockets);
+    }
+    sockets.add(socket);
+  }
+
+  _getInboundSocketsForStream(streamId) {
+    const sockets = this.streamInboundConnections.get(streamId);
+    if (!sockets) return [];
+    return [...sockets].filter(sock => !sock.destroyed);
+  }
+
+  _onceDrainOnSockets(sockets, callback) {
+    const waiting = sockets.filter(sock => !sock.destroyed && sock.writableNeedDrain);
 
     if (waiting.length === 0) {
       process.nextTick(callback);
@@ -214,15 +358,14 @@ class ConnectionPool {
     }
   }
 
-  pause() {
-    for (const sock of this.connections.values()) {
-      if (!sock.destroyed && typeof sock.pause === 'function') sock.pause();
+  _forgetConnection(key, socket) {
+    for (const [streamId, assignedKey] of this.streamOutboundConnections) {
+      if (assignedKey === key) this.streamOutboundConnections.delete(streamId);
     }
-  }
 
-  resume() {
-    for (const sock of this.connections.values()) {
-      if (!sock.destroyed && typeof sock.resume === 'function') sock.resume();
+    for (const [streamId, sockets] of this.streamInboundConnections) {
+      sockets.delete(socket);
+      if (sockets.size === 0) this.streamInboundConnections.delete(streamId);
     }
   }
 
@@ -256,12 +399,16 @@ class ConnectionPool {
     } catch {}
   }
 
-  registerStream(streamId, handlers) {
+  registerStream(streamId, handlers, options = {}) {
     this.activeStreams.set(streamId, handlers);
+    if (Object.prototype.hasOwnProperty.call(options, 'singleFlow')) {
+      this.setStreamMode(streamId, { singleFlow: Boolean(options.singleFlow) });
+    }
   }
 
   unregisterStream(streamId) {
     this.activeStreams.delete(streamId);
+    this.clearStreamMode(streamId);
   }
 
   getStreamHandler(streamId) {
@@ -279,6 +426,9 @@ class ConnectionPool {
     this.cleanupTimers.clear();
     this.dedupWindows.clear();
     this.seqCounters.clear();
+    this.streamOutboundConnections.clear();
+    this.streamInboundConnections.clear();
+    this.streamOptions.clear();
   }
 
   /**
@@ -291,6 +441,9 @@ class ConnectionPool {
       this.cleanupTimers.delete(streamId);
       this.dedupWindows.delete(streamId);
       this.seqCounters.delete(streamId);
+      this.streamOutboundConnections.delete(streamId);
+      this.streamInboundConnections.delete(streamId);
+      this.streamOptions.delete(streamId);
     }, STREAM_CLEANUP_GRACE_MS);
     if (typeof timer.unref === 'function') timer.unref();
     this.cleanupTimers.set(streamId, timer);
