@@ -9,7 +9,6 @@ const DEFAULT_MAX_BODY_SIZE = 220 * 1024 * 1024;
 const MAX_WS_BUFFER_SIZE = 16 * 1024 * 1024;
 const DEFAULT_HTTP_KEEPALIVE_TIMEOUT = 60 * 60 * 1000;
 const HTTP_HEADERS_TIMEOUT_BUFFER = 5000;
-const LOG_VALUE_MAX_LENGTH = 200;
 const SINGLE_FLOW_MEDIA_EXTENSION_RE = /\.(?:aac|aif|aiff|flac|m4a|m4b|mp3|oga|ogg|opus|wav|weba|m4v|mkv|mov|mp4|webm)(?:$|[?#])/i;
 const SINGLE_FLOW_REQUEST_CONTENT_TYPE_RE = /^(?:multipart\/form-data|audio\/|video\/|application\/octet-stream\b)/i;
 
@@ -73,11 +72,6 @@ function normalizeNonNegativeInteger(value, fallback) {
   return Math.floor(parsed);
 }
 
-function truncateForLog(value, maxLength = LOG_VALUE_MAX_LENGTH) {
-  const str = String(value ?? '');
-  return str.length > maxLength ? `${str.slice(0, maxLength)}…` : str;
-}
-
 function getRequestPathname(reqUrl) {
   try {
     return new URL(reqUrl || '/', 'http://okproxy.local').pathname || '/';
@@ -114,36 +108,6 @@ function shouldUseSingleFlow(reqUrl, headers = {}, method = 'GET') {
   }
 
   return false;
-}
-
-function createTimingLog(scope, details = {}, startedAt = process.hrtime.bigint()) {
-  const marks = new Map([['browser_accepted', 0]]);
-  let logged = false;
-
-  function elapsedMs() {
-    return Number(process.hrtime.bigint() - startedAt) / 1e6;
-  }
-
-  function mark(name) {
-    if (!marks.has(name)) marks.set(name, elapsedMs());
-  }
-
-  function log(outcome = 'done') {
-    if (logged) return;
-    logged = true;
-    mark('total');
-
-    const detailText = Object.entries(details)
-      .map(([key, value]) => `${key}=${JSON.stringify(truncateForLog(value))}`)
-      .join(' ');
-    const markText = [...marks.entries()]
-      .map(([key, ms]) => `${key}=${ms.toFixed(1)}ms`)
-      .join(' ');
-
-    console.log(`[TIMING] ${scope} outcome=${outcome} ${detailText} ${markText}`);
-  }
-
-  return { mark, log };
 }
 
 function waitForDrain(target, callback) {
@@ -298,8 +262,6 @@ function createHTTPServer(connectionPool, tcpServer, options = {}) {
   }
 
   const server = createServer((req, res) => {
-    const acceptedAt = process.hrtime.bigint();
-
     if (certBoundDomains && req.url.startsWith('/_okproxy/caddy-ask')) {
       try {
         const url = new URL(req.url, 'http://127.0.0.1');
@@ -353,19 +315,10 @@ function createHTTPServer(connectionPool, tcpServer, options = {}) {
     if (typeof selectedPool.setStreamMode === 'function') {
       selectedPool.setStreamMode(streamId, { singleFlow });
     }
-    const timing = createTimingLog('server-http', {
-      stream: streamId,
-      method: req.method,
-      path: req.url,
-      host: req.headers.host || '',
-      client: clientIp,
-      tunnelMode: singleFlow ? 'single-flow' : 'multipath'
-    }, acceptedAt);
     let bodySize = 0;
     let cleanedUp = false;
     let requestBackpressured = false;
     let responseBackpressured = false;
-    let firstByteToBrowser = false;
 
     const sentHeaders = selectedPool.send(encodeFrame(streamId, FrameType.HEADERS, JSON.stringify({
       method: req.method,
@@ -378,7 +331,6 @@ function createHTTPServer(connectionPool, tcpServer, options = {}) {
       tunnelMode: singleFlow ? 'single-flow' : 'multipath',
       tunnel: { singleFlow }
     })));
-    timing.mark('tunnel_headers_sent');
 
     if (!sentHeaders) {
       requestBackpressured = true;
@@ -395,8 +347,6 @@ function createHTTPServer(connectionPool, tcpServer, options = {}) {
       if (streamTimer) clearTimeout(streamTimer);
       streamTimer = setTimeout(() => {
         console.error(`[504] Stream timeout${isReset ? ' (reset)' : ''} for ${req.method} ${req.url} (stream ${streamId}, client ${clientIp})`);
-        timing.mark('stream_timeout');
-        timing.log('stream_timeout');
         selectedPool.send(encodeFrame(streamId, FrameType.ERROR, Buffer.from('Stream timeout')));
         cleanup();
         if (!res.writableEnded) {
@@ -419,7 +369,6 @@ function createHTTPServer(connectionPool, tcpServer, options = {}) {
       bodySize += chunk.length;
       if (bodySize > maxBodySize) {
         console.error(`[413] Request body too large: ${bodySize} bytes (max: ${maxBodySize}) for stream ${streamId}`);
-        timing.log('request_too_large');
         abortTunnelStream('Request body too large');
         if (!res.writableEnded) {
           res.statusCode = 413;
@@ -458,7 +407,6 @@ function createHTTPServer(connectionPool, tcpServer, options = {}) {
 
     req.on('error', (err) => {
       console.error('Request error:', err.message);
-      timing.log('request_error');
       cleanup();
     });
 
@@ -484,7 +432,6 @@ function createHTTPServer(connectionPool, tcpServer, options = {}) {
 
         if (frame.type === FrameType.HEADERS) {
           try {
-            timing.mark('response_headers_received');
             const headers = JSON.parse(frame.payload.toString());
             res.statusCode = headers.status || 200;
             if (headers.headers) {
@@ -496,12 +443,10 @@ function createHTTPServer(connectionPool, tcpServer, options = {}) {
             headersSent = true;
             if (!res.headersSent && typeof res.flushHeaders === 'function') {
               res.flushHeaders();
-              timing.mark('response_headers_flushed');
             }
             resetStreamTimeout();
           } catch (err) {
             console.error('Invalid headers frame:', err.message);
-            timing.log('invalid_response');
             cleanup();
             res.statusCode = 502;
             res.end('Invalid response');
@@ -512,12 +457,7 @@ function createHTTPServer(connectionPool, tcpServer, options = {}) {
             headersSent = true;
             if (!res.headersSent && typeof res.flushHeaders === 'function') {
               res.flushHeaders();
-              timing.mark('response_headers_flushed');
             }
-          }
-          if (!firstByteToBrowser && frame.payload.length > 0) {
-            firstByteToBrowser = true;
-            timing.mark('first_byte_to_browser');
           }
           if (!res.write(frame.payload) && !responseBackpressured) {
             responseBackpressured = true;
@@ -535,7 +475,6 @@ function createHTTPServer(connectionPool, tcpServer, options = {}) {
         } else if (frame.type === FrameType.ERROR) {
           const errorMsg = frame.payload?.toString() || 'Unknown error';
           console.error(`[502] Client sent ERROR frame for ${req.method} ${req.url} (stream ${streamId}): ${errorMsg}`);
-          timing.log('client_error');
           cleanup();
           if (!res.writableEnded) {
             res.statusCode = 502;
@@ -545,7 +484,6 @@ function createHTTPServer(connectionPool, tcpServer, options = {}) {
       },
       errorHandler: (err) => {
         console.error(`[502] Stream error for ${req.method} ${req.url} (stream ${streamId}):`, err.message);
-        timing.log('stream_error');
         cleanup();
         if (!res.writableEnded) {
           res.statusCode = 502;
@@ -554,14 +492,10 @@ function createHTTPServer(connectionPool, tcpServer, options = {}) {
       }
     });
 
-    res.on('finish', () => {
-      timing.log('complete');
-    });
 
     res.on('close', () => {
       if (!res.writableEnded) {
         console.error(`[INFO] Client closed connection early for ${req.method} ${req.url} (stream ${streamId})`);
-        timing.log('client_closed');
         abortTunnelStream('Public client closed connection');
       }
     });
