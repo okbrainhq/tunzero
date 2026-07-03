@@ -115,7 +115,8 @@ async function createTestEnv(options = {}) {
         serverPort: tlsPort,
         clientKey: certs.clientKey,
         clientCert: certs.clientCert,
-        caCert: certs.clientCa
+        caCert: certs.clientCa,
+        parallelSockets: options.parallelSockets
       });
 
       virtualSocket.on('ready', () => {

@@ -1,11 +1,20 @@
-// VirtualSocket — Multipath virtual socket layer
-// Duplicates traffic across all available network interfaces
+// VirtualSocket — Multipath/parallel virtual socket layer
+// Pins each stream to one tunnel socket to avoid head-of-line blocking while retaining reconnect/failover support
 
 const { encodeFrame, FrameType, CONTROL_FRAME_TYPES, DedupWindow } = require('../../../packages/frame-protocol');
 const { RealSocket, SEQ_RESET_THRESHOLD } = require('./real-socket');
 const { InterfaceDetector } = require('./interface-detector');
 const { NetworkWatchDog } = require('./network-watchdog');
 const { EventEmitter } = require('node:events');
+
+const MAX_PARALLEL_SOCKETS = 32;
+
+function normalizeParallelSockets(value) {
+  if (value === undefined || value === null || value === '') return 1;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 1) return 1;
+  return Math.min(MAX_PARALLEL_SOCKETS, Math.floor(parsed));
+}
 
 // Grace period before cleaning up completed-stream dedup/seq state.
 // Must exceed the maximum keepalive timeout (45 s multipath / 10 s single)
@@ -36,6 +45,11 @@ class VirtualSocket extends EventEmitter {
     this.destroyed = false;
     this._readyEmitted = false;
     this._failureCount = new Map(); // interfaceName -> consecutive failures
+    this.parallelSockets = normalizeParallelSockets(config.parallelSockets ?? process.env.OKPROXY_PARALLEL_SOCKETS);
+    this.streamOutboundSockets = new Map(); // streamId -> realSocket name (client -> server single-flow)
+    this.streamInboundSockets = new Map(); // streamId -> Set<RealSocket> (server -> client)
+    this.streamOptions = new Map(); // streamId -> { singleFlow }
+    this.roundRobinCursor = 0;
   }
 
   /**
@@ -53,8 +67,8 @@ class VirtualSocket extends EventEmitter {
       });
       this.detector.start();
     } else {
-      // Single-connection: default socket + network watchdog
-      this._createRealSocket('default', null);
+      // Single-connection: one or more parallel sockets + network watchdog
+      this._ensureInterfaceSockets('default', null);
       this.networkWatchdog = new NetworkWatchDog(() => {
         console.log(`[${new Date().toISOString()}] [virtual-socket] network change detected, reconnecting`);
         for (const rs of this.realSockets.values()) {
@@ -71,15 +85,16 @@ class VirtualSocket extends EventEmitter {
     // Remove sockets for interfaces that disappeared, or recreate sockets when
     // the same interface name gets a new IP (common when WiFi changes networks).
     for (const [name, rs] of [...this.realSockets]) {
-      if (name === 'default') continue;
+      const baseName = this._baseInterfaceName(name);
+      if (baseName === 'default') continue;
 
-      if (!activeByName.has(name)) {
+      if (!activeByName.has(baseName)) {
         console.log(`[${new Date().toISOString()}] [virtual-socket] Removing disappeared interface: ${name}`);
         this._removeRealSocket(name, rs);
         continue;
       }
 
-      const nextIp = activeByName.get(name);
+      const nextIp = activeByName.get(baseName);
       const currentIp = this._getSocketLocalAddress(rs);
       if (currentIp !== nextIp) {
         console.log(`[${new Date().toISOString()}] [virtual-socket] Interface ${name} IP changed: ${currentIp || 'auto'} -> ${nextIp || 'auto'}, reconnecting`);
@@ -92,14 +107,31 @@ class VirtualSocket extends EventEmitter {
 
     // Add sockets for new interfaces or interfaces removed above for IP change.
     for (const iface of interfaces) {
-      if (!this.realSockets.has(iface.name)) {
-        this._createRealSocket(iface.name, iface.ip);
-      }
+      this._ensureInterfaceSockets(iface.name, iface.ip);
     }
 
     // Emit ready when we have at least one connection
     if (this.realSockets.size > 0) {
       this._checkReady();
+    }
+  }
+
+  _socketName(interfaceName, laneIndex) {
+    if (this.parallelSockets <= 1) return interfaceName;
+    return `${interfaceName}#${laneIndex + 1}`;
+  }
+
+  _baseInterfaceName(socketName) {
+    const match = /^(.*)#([0-9]+)$/.exec(socketName);
+    return match ? match[1] : socketName;
+  }
+
+  _ensureInterfaceSockets(interfaceName, localAddress) {
+    for (let lane = 0; lane < this.parallelSockets; lane++) {
+      const socketName = this._socketName(interfaceName, lane);
+      if (!this.realSockets.has(socketName)) {
+        this._createRealSocket(socketName, localAddress);
+      }
     }
   }
 
@@ -111,6 +143,7 @@ class VirtualSocket extends EventEmitter {
     if (this.realSockets.get(interfaceName) === rs) {
       this.realSockets.delete(interfaceName);
     }
+    this._forgetRealSocket(interfaceName, rs);
     this._failureCount.delete(interfaceName);
     if (rs && typeof rs.destroy === 'function') {
       rs.destroy();
@@ -141,6 +174,7 @@ class VirtualSocket extends EventEmitter {
 
       if (status === 'failed') {
         this.realSockets.delete(interfaceName);
+        this._forgetRealSocket(interfaceName, rs);
         this._resetSessionStateIfFullyDisconnected();
         this._checkAllFailed();
       }
@@ -152,7 +186,7 @@ class VirtualSocket extends EventEmitter {
     });
 
     rs.on('frame', (frame) => {
-      this._onFrame(frame);
+      this._onFrame(frame, rs);
     });
 
     rs.on('resetSeq', (frame) => {
@@ -183,6 +217,9 @@ class VirtualSocket extends EventEmitter {
     this.cleanupTimers.clear();
     this.seqCounters.clear();
     this.dedupWindows.clear();
+    this.streamOutboundSockets.clear();
+    this.streamInboundSockets.clear();
+    this.streamOptions.clear();
   }
 
   _checkAllFailed() {
@@ -194,56 +231,190 @@ class VirtualSocket extends EventEmitter {
 
   /**
    * Write a frame (encoded buffer — 13-byte header).
-   * Patches the seqNo field for data frames, then duplicates to all connections.
+   * Patches the seqNo field for data frames. Normal streams use traditional
+   * multipath duplication; single-flow streams are pinned to one socket.
    */
   write(buf) {
     if (this.destroyed) return false;
 
     const type = buf.readUInt8(4);
-    let seqNo = 0;
+
+    if (CONTROL_FRAME_TYPES.has(type)) {
+      return this._writeToRealSockets(buf, this._allConnectedRealSockets());
+    }
+
+    const streamId = buf.readUInt32BE(0);
+    let seqNo = (this.seqCounters.get(streamId) || 0) + 1;
+
+    if (seqNo > SEQ_RESET_THRESHOLD) {
+      this._sendResetSeq(streamId);
+      seqNo = 0;
+    }
+
+    this.seqCounters.set(streamId, seqNo);
+    buf.writeUInt32BE(seqNo, 5);
+
+    // When the client sends outbound FIN/ERROR the response is complete
+    // and the stream is fully done in both directions. Schedule TTL
+    // cleanup. (Inbound FIN only ended the request body — the response
+    // may still be streaming, so cleanup is deferred to here.)
+    if (type === FrameType.FIN || type === FrameType.ERROR) {
+      this._scheduleStreamCleanup(streamId);
+    }
+
+    const targets = this._isSingleFlowStream(streamId)
+      ? this._selectOutboundRealSocket(streamId)
+      : this._allConnectedRealSockets();
+    const ok = this._writeToRealSockets(buf, targets);
+    if (!ok && this._allConnectedRealSockets().length === 0) {
+      this.emit('error', new Error('All socket writes failed'));
+    }
+    return ok;
+  }
+
+  onceDrain(callback) {
+    this._onceDrainOnSockets(
+      this._allConnectedRealSockets().map(([, rs]) => rs.socket).filter(Boolean),
+      callback
+    );
+  }
+
+  onceDrainForStream(streamId, callback) {
+    const sockets = this._isSingleFlowStream(streamId) ? this._getOutboundSocketsForStream(streamId) : [];
+    this._onceDrainOnSockets(
+      sockets.length > 0 ? sockets : this._allConnectedRealSockets().map(([, rs]) => rs.socket).filter(Boolean),
+      callback
+    );
+  }
+
+  pause() {
+    for (const rs of this.realSockets.values()) {
+      if (rs.isConnected() && typeof rs.pause === 'function') rs.pause();
+    }
+  }
+
+  resume() {
+    for (const rs of this.realSockets.values()) {
+      if (rs.isConnected() && typeof rs.resume === 'function') rs.resume();
+    }
+  }
+
+  pauseStream(streamId) {
+    const realSockets = this._getInboundRealSocketsForStream(streamId);
+    if (realSockets.length === 0) return this.pause();
+    for (const rs of realSockets) {
+      if (rs.isConnected() && typeof rs.pause === 'function') rs.pause();
+    }
+  }
+
+  resumeStream(streamId) {
+    const realSockets = this._getInboundRealSocketsForStream(streamId);
+    if (realSockets.length === 0) return this.resume();
+    for (const rs of realSockets) {
+      if (rs.isConnected() && typeof rs.resume === 'function') rs.resume();
+    }
+  }
+
+  _allConnectedRealSockets() {
+    return [...this.realSockets.entries()].filter(([, rs]) => rs.isConnected());
+  }
+
+  _writeToRealSockets(buf, entries) {
     let connected = 0;
     let backpressured = false;
 
-    if (!CONTROL_FRAME_TYPES.has(type)) {
-      const streamId = buf.readUInt32BE(0);
-      seqNo = (this.seqCounters.get(streamId) || 0) + 1;
-
-      if (seqNo > SEQ_RESET_THRESHOLD) {
-        this._sendResetSeq(streamId);
-        seqNo = 0;
-      }
-
-      this.seqCounters.set(streamId, seqNo);
-      buf.writeUInt32BE(seqNo, 5);
-
-      // When the client sends outbound FIN/ERROR the response is complete
-      // and the stream is fully done in both directions. Schedule TTL
-      // cleanup. (Inbound FIN only ended the request body — the response
-      // may still be streaming, so cleanup is deferred to here.)
-      if (type === FrameType.FIN || type === FrameType.ERROR) {
-        this._scheduleStreamCleanup(streamId);
-      }
-    }
-
-    for (const rs of this.realSockets.values()) {
+    for (const [, rs] of entries) {
       if (rs.isConnected()) {
         connected++;
         if (!rs.write(buf)) backpressured = true;
       }
     }
 
-    if (connected === 0) {
-      this.emit('error', new Error('All socket writes failed'));
-      return false;
-    }
-
-    return !backpressured;
+    return connected > 0 && !backpressured;
   }
 
-  onceDrain(callback) {
-    const waiting = [...this.realSockets.values()]
-      .filter(rs => rs.isConnected() && rs.socket && rs.socket.writableNeedDrain)
-      .map(rs => rs.socket);
+  setStreamMode(streamId, options = {}) {
+    const current = this.streamOptions.get(streamId) || {};
+    if (typeof options.singleFlow === 'boolean') {
+      current.singleFlow = options.singleFlow;
+    }
+
+    if (current.singleFlow) {
+      this.streamOptions.set(streamId, current);
+    } else {
+      this.streamOptions.delete(streamId);
+      this.streamOutboundSockets.delete(streamId);
+    }
+  }
+
+  clearStreamMode(streamId) {
+    this.streamOptions.delete(streamId);
+    this.streamOutboundSockets.delete(streamId);
+    this.streamInboundSockets.delete(streamId);
+  }
+
+  _isSingleFlowStream(streamId) {
+    return this.streamOptions.get(streamId)?.singleFlow === true;
+  }
+
+  _selectOutboundRealSocket(streamId) {
+    const existingName = this.streamOutboundSockets.get(streamId);
+    const existing = existingName ? this.realSockets.get(existingName) : null;
+    if (existing && existing.isConnected()) return [[existingName, existing]];
+
+    const connected = this._allConnectedRealSockets();
+    if (connected.length === 0) return [];
+
+    const loadByName = new Map();
+    for (const name of this.streamOutboundSockets.values()) {
+      if (this.realSockets.has(name)) loadByName.set(name, (loadByName.get(name) || 0) + 1);
+    }
+
+    let best = null;
+    let bestScore = Infinity;
+    const start = connected.length > 0 ? this.roundRobinCursor % connected.length : 0;
+
+    for (let i = 0; i < connected.length; i++) {
+      const index = (start + i) % connected.length;
+      const [name, rs] = connected[index];
+      const load = loadByName.get(name) || 0;
+      const score = load + (rs.socket?.writableNeedDrain ? 1000000 : 0);
+      if (score < bestScore) {
+        bestScore = score;
+        best = { name, rs, index };
+      }
+    }
+
+    if (!best) return [];
+    this.roundRobinCursor = (best.index + 1) % connected.length;
+    this.streamOutboundSockets.set(streamId, best.name);
+    return [[best.name, best.rs]];
+  }
+
+  _getOutboundSocketsForStream(streamId) {
+    const name = this.streamOutboundSockets.get(streamId);
+    const rs = name ? this.realSockets.get(name) : null;
+    return rs && rs.isConnected() && rs.socket ? [rs.socket] : [];
+  }
+
+  _markInboundRealSocket(streamId, rs) {
+    if (!rs || !rs.isConnected()) return;
+    let realSockets = this.streamInboundSockets.get(streamId);
+    if (!realSockets) {
+      realSockets = new Set();
+      this.streamInboundSockets.set(streamId, realSockets);
+    }
+    realSockets.add(rs);
+  }
+
+  _getInboundRealSocketsForStream(streamId) {
+    const realSockets = this.streamInboundSockets.get(streamId);
+    if (!realSockets) return [];
+    return [...realSockets].filter(rs => rs.isConnected());
+  }
+
+  _onceDrainOnSockets(sockets, callback) {
+    const waiting = sockets.filter(socket => socket && !socket.destroyed && socket.writableNeedDrain);
 
     if (waiting.length === 0) {
       process.nextTick(callback);
@@ -277,15 +448,14 @@ class VirtualSocket extends EventEmitter {
     }
   }
 
-  pause() {
-    for (const rs of this.realSockets.values()) {
-      if (rs.isConnected() && typeof rs.pause === 'function') rs.pause();
+  _forgetRealSocket(name, rs) {
+    for (const [streamId, assignedName] of this.streamOutboundSockets) {
+      if (assignedName === name) this.streamOutboundSockets.delete(streamId);
     }
-  }
 
-  resume() {
-    for (const rs of this.realSockets.values()) {
-      if (rs.isConnected() && typeof rs.resume === 'function') rs.resume();
+    for (const [streamId, realSockets] of this.streamInboundSockets) {
+      realSockets.delete(rs);
+      if (realSockets.size === 0) this.streamInboundSockets.delete(streamId);
     }
   }
 
@@ -322,7 +492,7 @@ class VirtualSocket extends EventEmitter {
     } catch { /* ignore malformed */ }
   }
 
-  _onFrame(frame) {
+  _onFrame(frame, sourceRealSocket = null) {
     // Control frames are connection-local, emit directly
     if (frame.streamId === 0 && frame.type !== FrameType.HEADERS && frame.type !== FrameType.DATA && frame.type !== FrameType.FIN && frame.type !== FrameType.ERROR && frame.type !== FrameType.UPGRADE) {
       return; // PING/PONG/INIT/RESET_SEQ handled by RealSocket
@@ -330,6 +500,7 @@ class VirtualSocket extends EventEmitter {
 
     // Data frame — dedup check
     const streamId = frame.streamId;
+    if (sourceRealSocket) this._markInboundRealSocket(streamId, sourceRealSocket);
 
     if (frame.type === FrameType.FIN || frame.type === FrameType.ERROR) {
       // Run through dedup — only deliver the first copy
@@ -390,6 +561,9 @@ class VirtualSocket extends EventEmitter {
       this.cleanupTimers.delete(streamId);
       this.dedupWindows.delete(streamId);
       this.seqCounters.delete(streamId);
+      this.streamOutboundSockets.delete(streamId);
+      this.streamInboundSockets.delete(streamId);
+      this.streamOptions.delete(streamId);
     }, STREAM_CLEANUP_GRACE_MS);
     if (typeof timer.unref === 'function') timer.unref();
     this.cleanupTimers.set(streamId, timer);
@@ -436,6 +610,9 @@ class VirtualSocket extends EventEmitter {
     this.cleanupTimers.clear();
     this.dedupWindows.clear();
     this.seqCounters.clear();
+    this.streamOutboundSockets.clear();
+    this.streamInboundSockets.clear();
+    this.streamOptions.clear();
     this.removeAllListeners();
   }
 }

@@ -6,7 +6,8 @@ A secure ngrok alternative using TLS encryption with mutual TLS (mTLS) authentic
 
 - **TLS 1.2+ encryption** with mutual TLS (mTLS)
 - **Multipath** — duplicates traffic across WiFi, iPhone USB, and other interfaces concurrently. Fastest path wins; automatic failover
-- **Multiplexing** — multiple concurrent HTTP requests over a single set of TLS connections
+- **Multiplexing** — multiple concurrent HTTP requests over a set of TLS tunnel connections
+- **Parallel tunnel sockets** — optional extra tunnel sockets plus single-flow upload/media routing keep normal traffic responsive
 - **WebSocket support** — full duplex WebSocket proxying
 - **Streaming** — SSE, large file transfers, and long-lived connections
 - **Auto-reconnection** — per-connection exponential backoff (500ms → 3s max)
@@ -134,15 +135,18 @@ curl -si 'http://localhost:8080/_okproxy/caddy-ask?domain=p0.example.test'
 
 ## Multipath
 
-When `--multipath` is enabled, the client binds a TLS connection to each internet-capable network interface (WiFi, iPhone USB, etc.). Every frame is duplicated across all connections — whichever delivers first wins. Duplicates are discarded via per-stream sequence numbers.
+When `--multipath` is enabled, the client binds TLS connections to each internet-capable network interface (WiFi, iPhone USB, etc.). With `--parallel-sockets <n>`, each interface can open multiple tunnel sockets. Normal streams keep traditional multipath behavior: each frame is duplicated across all active tunnel sockets and the fastest copy wins.
 
-Multipath keeps a relaxed keepalive rhythm (15s PING / 45s timeout) since redundancy handles individual link failures. Single-connection mode uses aggressive keepalive (3s PING / 10s timeout) for fast failure detection.
+Large upload/streaming requests opt out of multipath duplication and use a single flow. The server detects these by request features: common audio/video file extensions, `Accept: audio/*` / `video/*`, `Sec-Fetch-Dest: audio|video`, `Range` requests, multipart/form-data uploads, raw binary uploads, and resumable upload headers. This keeps audio/file traffic on one tunnel socket while unrelated requests can still use other sockets. Multipath keeps a relaxed keepalive rhythm (15s PING / 45s timeout), while single-interface mode uses aggressive keepalive (3s PING / 10s timeout) for fast failure detection.
 
 ```bash
 # Enable on the client
 npm run client -- --multipath
 
-# The deploy scripts enable it by default via MULTIPATH_ENABLED=true
+# Add parallel lanes per interface for large audio/file transfers
+npm run client -- --multipath --parallel-sockets 4
+
+# The deploy scripts enable multipath and default to PARALLEL_SOCKETS=4
 ```
 
 With multipath, you'll see per-interface logs:
@@ -302,7 +306,7 @@ Server ports: `80` HTTP redirect, `443` public HTTPS via Caddy, `9443` TLS tunne
 
 ## Client Deployment (macOS)
 
-The client deploy script copies `setup-client-remote.sh` to the Mac, installs/uses Node.js, clones the repo to `~/okproxy`, uploads the selected client certs, and creates a LaunchAgent with `--multipath` enabled.
+The client deploy script copies `setup-client-remote.sh` to the Mac, installs/uses Node.js, clones the repo to `~/okproxy`, uploads the selected client certs, and creates a LaunchAgent with `--multipath` plus `--parallel-sockets ${PARALLEL_SOCKETS:-4}` enabled.
 
 Create `.deploy.client` from `.deploy.client.example`:
 
@@ -418,6 +422,7 @@ OKPROXY_NODE_PATH=/path/to/node ./setup-client-remote.sh ...
 --target <host:port>        Local target service (default: localhost:3000)
 --target-timeout <ms>       Target response/upgrade timeout; 0 disables (default: 30000)
 --target-keepalive-timeout <ms> Target idle keep-alive timeout; 0 disables idle expiry (default: 3600000)
+--parallel-sockets <n>      Parallel tunnel sockets per interface, 1-32 (default: 1; deploy default: 4)
 --key <path>                Client private key
 --cert <path>               Client certificate
 --ca <path>                 CA certificate
@@ -456,15 +461,15 @@ OKPROXY_NODE_PATH=/path/to/node ./setup-client-remote.sh ...
 Per-connection on connect:
 
 ```
-Client → Server: { interface: "en0", maxFrameSize: 1048576 }
+Client → Server: { interface: "en0#1", maxFrameSize: 1048576 }
 Server → Client: { maxFrameSize: 1048576, maxConcurrentStreams: 100 }
 ```
 
-Each connection performs its own INIT independently. The `interface` field tells the server which physical interface this connection represents, so reconnections from the same interface replace the old one.
+Each connection performs its own INIT independently. The `interface` field identifies the physical interface and optional lane suffix (for example, `en0#1`). Reconnecting with the same interface/lane replaces the old socket.
 
 ### Sequence Numbers
 
-Every data frame carries a 32-bit, per-stream monotonic sequence number. When multipath duplicates a frame across multiple connections, the receiver uses a 128-bit sliding window to discard duplicates — first arrival wins. `RESET_SEQ` prevents overflow on long-lived streams.
+Every data frame carries a 32-bit, per-stream monotonic sequence number. Normal multipath streams are duplicated across tunnel sockets and the receiver uses a 128-bit sliding window to discard duplicates. Single-flow streams (media extensions, audio/video accepts, Range requests, multipart/raw uploads, or resumable upload headers) are pinned to one tunnel socket. `RESET_SEQ` prevents overflow on long-lived streams.
 
 ### Keepalive
 
@@ -489,7 +494,7 @@ apps/
   client/                   # Tunnel client
     index.js
     lib/
-      virtual-socket.js     # Multipath layer: duplication & dedup
+      virtual-socket.js     # Multipath/parallel lane layer: stream affinity & dedup
       real-socket.js        # Single TLS connection per interface
       interface-detector.js # Connectivity-based interface discovery
       network-watchdog.js   # OS interface change detection

@@ -3,7 +3,7 @@
 
 const { describe, it } = require('node:test');
 const assert = require('node:assert');
-const { DedupWindow, FrameType } = require('../../../packages/frame-protocol');
+const { DedupWindow, FrameType, encodeFrame } = require('../../../packages/frame-protocol');
 const { shouldSkip } = require('../../../apps/client/lib/interface-detector');
 const { createTestEnv, httpRequest, getCertPaths } = require('./setup');
 const { VirtualSocket } = require('../../../apps/client/lib/virtual-socket');
@@ -167,6 +167,74 @@ describe('ConnectionPool - Multiple Connections', () => {
     } finally {
       await env.cleanup();
     }
+  });
+});
+
+describe('Path-selected single-flow streams', () => {
+  function fakeSocket(label) {
+    return {
+      label,
+      destroyed: false,
+      writableNeedDrain: false,
+      writes: [],
+      write(buf) {
+        this.writes.push(buf);
+        return true;
+      },
+      once() {},
+      removeListener() {},
+      pause() { this.paused = true; },
+      resume() { this.paused = false; }
+    };
+  }
+
+  it('server pool should broadcast normal streams and pin single-flow streams', () => {
+    const pool = new ConnectionPool();
+    const a = fakeSocket('a');
+    const b = fakeSocket('b');
+    pool.add('serial', 'lane-a', a);
+    pool.add('serial', 'lane-b', b);
+
+    pool.send(encodeFrame(1, FrameType.HEADERS, '{}'));
+    pool.send(encodeFrame(1, FrameType.DATA, Buffer.from('normal-stream')));
+
+    assert.strictEqual(a.writes.length, 2, 'normal stream should write to lane a');
+    assert.strictEqual(b.writes.length, 2, 'normal stream should write to lane b');
+
+    pool.setStreamMode(2, { singleFlow: true });
+    pool.send(encodeFrame(2, FrameType.HEADERS, '{}'));
+    pool.send(encodeFrame(2, FrameType.DATA, Buffer.from('single-flow-stream')));
+
+    const singleFlowWrites = [a.writes.length - 2, b.writes.length - 2];
+    assert.deepStrictEqual(singleFlowWrites.sort((x, y) => x - y), [0, 2], 'single-flow stream should use exactly one lane');
+  });
+
+  it('client virtual socket should broadcast normal streams and pin single-flow streams', () => {
+    const vs = new VirtualSocket({
+      serverHost: 'localhost',
+      serverPort: 9999,
+      clientKey: 'none',
+      clientCert: 'none',
+      caCert: 'none',
+      parallelSockets: 2
+    });
+    const a = { isConnected: () => true, socket: { writableNeedDrain: false }, writes: [], write(buf) { this.writes.push(buf); return true; } };
+    const b = { isConnected: () => true, socket: { writableNeedDrain: false }, writes: [], write(buf) { this.writes.push(buf); return true; } };
+    vs.realSockets.set('default#1', a);
+    vs.realSockets.set('default#2', b);
+
+    vs.write(encodeFrame(1, FrameType.HEADERS, '{}'));
+    vs.write(encodeFrame(1, FrameType.DATA, Buffer.from('normal-stream')));
+
+    assert.strictEqual(a.writes.length, 2, 'normal stream should write to first socket');
+    assert.strictEqual(b.writes.length, 2, 'normal stream should write to second socket');
+
+    vs.setStreamMode(2, { singleFlow: true });
+    vs.write(encodeFrame(2, FrameType.HEADERS, '{}'));
+    vs.write(encodeFrame(2, FrameType.DATA, Buffer.from('single-flow-stream')));
+
+    const singleFlowWrites = [a.writes.length - 2, b.writes.length - 2];
+    assert.deepStrictEqual(singleFlowWrites.sort((x, y) => x - y), [0, 2], 'single-flow stream should use exactly one socket');
   });
 });
 

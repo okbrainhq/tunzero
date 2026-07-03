@@ -112,7 +112,12 @@ function createTimingLog(scope, details = {}, initialMark = 'tunnel_request_rece
   return { mark, log };
 }
 
-function waitForConnectionDrain(connection, callback) {
+function waitForConnectionDrain(connection, callback, streamId = null) {
+  if (streamId !== null && connection && typeof connection.onceDrainForStream === 'function') {
+    connection.onceDrainForStream(streamId, callback);
+    return;
+  }
+
   if (connection && typeof connection.onceDrain === 'function') {
     connection.onceDrain(callback);
     return;
@@ -139,14 +144,20 @@ function waitForConnectionDrain(connection, callback) {
   socket.once('error', done);
 }
 
-function pauseConnection(connection) {
-  if (connection && typeof connection.pause === 'function') connection.pause();
+function pauseConnection(connection, streamId = null) {
+  if (streamId !== null && connection && typeof connection.pauseStream === 'function') connection.pauseStream(streamId);
+  else if (connection && typeof connection.pause === 'function') connection.pause();
   else if (connection?.socket && typeof connection.socket.pause === 'function') connection.socket.pause();
 }
 
-function resumeConnection(connection) {
-  if (connection && typeof connection.resume === 'function') connection.resume();
+function resumeConnection(connection, streamId = null) {
+  if (streamId !== null && connection && typeof connection.resumeStream === 'function') connection.resumeStream(streamId);
+  else if (connection && typeof connection.resume === 'function') connection.resume();
   else if (connection?.socket && typeof connection.socket.resume === 'function') connection.socket.resume();
+}
+
+function isSingleFlowRequest(info) {
+  return info?.tunnelMode === 'single-flow' || info?.singleFlow === true || info?.tunnel?.singleFlow === true;
 }
 
 function createProxy(connection, targetPort, targetHost = 'localhost', maxStreams = 100, options = {}) {
@@ -227,8 +238,10 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
 
         const canWrite = wsState.socket.write(completeFrame);
         if (!canWrite && !isCloseFrame) {
-          wsState.socket.pause();
-          wsState.socket.once('drain', () => { wsState.socket.resume(); });
+          pauseConnection(connection, frame.streamId);
+          wsState.socket.once('drain', () => {
+            if (!wsState.cleanupCalled) resumeConnection(connection, frame.streamId);
+          });
         }
 
         if (isCloseFrame) {
@@ -262,6 +275,11 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
       if (upgradeInfo.protocol !== 'websocket') {
         connection.write(encodeFrame(streamId, FrameType.ERROR, Buffer.from('Unsupported protocol')));
         return;
+      }
+
+      const singleFlow = isSingleFlowRequest(upgradeInfo);
+      if (typeof connection.setStreamMode === 'function') {
+        connection.setStreamMode(streamId, { singleFlow });
       }
 
       const timing = createTimingLog('client-ws', {
@@ -327,6 +345,7 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
         wsState.cleanupCalled = true;
 
         activeWebSockets.delete(streamId);
+        resumeConnection(connection, streamId);
 
         if (wsState.socket && !wsState.socket.destroyed) {
           wsState.socket.destroy();
@@ -334,6 +353,10 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
 
         if (sendFin) {
           connection.write(encodeFrame(streamId, FrameType.FIN, Buffer.alloc(0)));
+        }
+
+        if (typeof connection.clearStreamMode === 'function') {
+          connection.clearStreamMode(streamId);
         }
 
         timing.log(sendFin ? 'closed' : 'failed');
@@ -378,7 +401,7 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
             if (!canWrite) {
               proxySocket.pause();
               pendingOffset = end;
-              waitForConnectionDrain(connection, sendLargeFrameChunk);
+              waitForConnectionDrain(connection, sendLargeFrameChunk, streamId);
               return;
             }
             pendingOffset = end;
@@ -424,7 +447,7 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
                 proxySocket.pause();
                 waitForConnectionDrain(connection, () => {
                   if (!proxySocket.destroyed) proxySocket.resume();
-                });
+                }, streamId);
               }
             } else {
               pendingLargeFrame = rawFrame;
@@ -436,7 +459,7 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
             if (isCloseFrame) {
               setImmediate(() => {
                 if (!connection.write(encodeFrame(streamId, FrameType.FIN, Buffer.alloc(0)))) {
-                  waitForConnectionDrain(connection, cleanup);
+                  waitForConnectionDrain(connection, cleanup, streamId);
                 } else {
                   cleanup();
                 }
@@ -488,12 +511,20 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
     } catch (err) {
       console.error('Invalid UPGRADE payload:', err.message);
       connection.write(encodeFrame(streamId, FrameType.ERROR, Buffer.from('Invalid upgrade request')));
+      if (typeof connection.clearStreamMode === 'function') {
+        connection.clearStreamMode(streamId);
+      }
     }
   }
 
   function startProxyRequest(streamId, payload) {
     try {
       const reqInfo = JSON.parse(payload.toString());
+      const singleFlow = isSingleFlowRequest(reqInfo);
+      if (typeof connection.setStreamMode === 'function') {
+        connection.setStreamMode(streamId, { singleFlow });
+      }
+
       const timing = createTimingLog('client-http', {
         stream: streamId,
         method: reqInfo.method,
@@ -665,10 +696,10 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
           if (this.completed || this.req.destroyed) return;
           if (!this.req.write(chunk) && !this.targetRequestBackpressured) {
             this.targetRequestBackpressured = true;
-            pauseConnection(connection);
+            pauseConnection(connection, streamId);
             this.req.once('drain', () => {
               this.targetRequestBackpressured = false;
-              if (!this.completed) resumeConnection(connection);
+              if (!this.completed) resumeConnection(connection, streamId);
             });
           }
         },
@@ -680,7 +711,7 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
           waitForConnectionDrain(connection, () => {
             this.targetResponseBackpressured = false;
             if (!this.completed) proxyRes.resume();
-          });
+          }, streamId);
         },
 
         endRequest() {
@@ -698,9 +729,12 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
         cleanup() {
           if (this.completed) return;
           this.completed = true;
-          if (this.targetRequestBackpressured) resumeConnection(connection);
+          if (this.targetRequestBackpressured) resumeConnection(connection, streamId);
           this.clearTargetTimer();
           activeStreams.delete(streamId);
+          if (typeof connection.clearStreamMode === 'function') {
+            connection.clearStreamMode(streamId);
+          }
         }
       };
 
@@ -726,6 +760,9 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
 
     } catch (err) {
       connection.write(encodeFrame(streamId, FrameType.ERROR, Buffer.from('Invalid request')));
+      if (typeof connection.clearStreamMode === 'function') {
+        connection.clearStreamMode(streamId);
+      }
     }
   }
 

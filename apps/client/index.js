@@ -8,8 +8,8 @@ const DEFAULT_KEY = './.certs/client-key.pem';
 const DEFAULT_CERT = './.certs/client-cert.pem';
 const DEFAULT_CA = './.ca/ca-cert.pem';
 
-function parseArgs() {
-  const args = process.argv.slice(2);
+function parseArgs(argv) {
+  const args = argv || process.argv.slice(2);
   const options = {
     serverHost: 'localhost',
     serverPort: 9443,
@@ -21,7 +21,8 @@ function parseArgs() {
     domains: [],
     preserveHost: false,
     targetTimeout: 30000,
-    targetKeepAliveTimeout: 60 * 60 * 1000
+    targetKeepAliveTimeout: 60 * 60 * 1000,
+    parallelSockets: 1
   };
 
   for (let i = 0; i < args.length; i++) {
@@ -75,6 +76,19 @@ function parseArgs() {
         }
         options.targetKeepAliveTimeout = targetKeepAliveTimeout;
         break;
+      case '--parallel-sockets':
+        const parallelSocketsValue = args[++i];
+        if (!/^[0-9]+$/.test(parallelSocketsValue || '')) {
+          console.error(`Error: Invalid parallel sockets ${parallelSocketsValue}. Must be an integer from 1 to 32.`);
+          process.exit(1);
+        }
+        const parallelSockets = parseInt(parallelSocketsValue, 10);
+        if (parallelSockets < 1 || parallelSockets > 32) {
+          console.error(`Error: Invalid parallel sockets ${parallelSocketsValue}. Must be an integer from 1 to 32.`);
+          process.exit(1);
+        }
+        options.parallelSockets = parallelSockets;
+        break;
       case '--key':
         options.clientKey = args[++i];
         break;
@@ -102,6 +116,7 @@ Options:
   --target <host:port>    Local target service (default: localhost:3000)
   --target-timeout <ms>   Target response/upgrade timeout; 0 disables (default: 30000)
   --target-keepalive-timeout <ms> Target idle keep-alive timeout; 0 disables idle expiry (default: 3600000)
+  --parallel-sockets <n>  Parallel tunnel sockets per interface, 1-32 (default: 1)
   --key <path>            Client private key (default: ${DEFAULT_KEY})
   --cert <path>           Client certificate (default: ${DEFAULT_CERT})
   --ca <path>             CA certificate to verify server (default: ${DEFAULT_CA})
@@ -125,6 +140,7 @@ function main() {
   console.log(`Target: ${config.targetHost}:${config.targetPort}`);
   console.log(`Target timeout: ${config.targetTimeout === 0 ? 'disabled' : `${config.targetTimeout}ms`}`);
   console.log(`Target keep-alive timeout: ${config.targetKeepAliveTimeout === 0 ? 'disabled' : `${config.targetKeepAliveTimeout}ms`}`);
+  console.log(`Parallel sockets per interface: ${config.parallelSockets}`);
   console.log(`Multipath: ${process.env.MULTIPATH_ENABLED === 'true' ? 'enabled' : 'disabled (use --multipath to enable)'}`);
 
   let proxy = null;

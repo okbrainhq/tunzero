@@ -2,15 +2,15 @@
 
 # setup-client-remote.sh
 # Purpose: Installs the tunnel client on macOS and configures it to run as a LaunchAgent.
-# Usage: ./setup-client-remote.sh <SERVER_HOST> <TARGET_HOST> <REPO_URL> [CLIENT_NAME] [CERT_DIR]
-# Example: ./setup-client-remote.sh t0.arunoda.me:9443 localhost:3000 https://github.com/arunoda/okproxy.git blog ~/.okproxy/certs/blog
+# Usage: ./setup-client-remote.sh <SERVER_HOST> <TARGET_HOST> <REPO_URL> [CLIENT_NAME] [CERT_DIR] [PARALLEL_SOCKETS]
+# Example: ./setup-client-remote.sh t0.arunoda.me:9443 localhost:3000 https://github.com/arunoda/okproxy.git blog ~/.okproxy/certs/blog 4
 
 set -eo pipefail
 
 # Collect positional args
 if [ $# -lt 3 ]; then
     echo "Error: SERVER_HOST, TARGET_HOST, and REPO_URL are required."
-    echo "Usage: ./setup-client-remote.sh <SERVER_HOST> <TARGET_HOST> <REPO_URL>"
+    echo "Usage: ./setup-client-remote.sh <SERVER_HOST> <TARGET_HOST> <REPO_URL> [CLIENT_NAME] [CERT_DIR] [PARALLEL_SOCKETS]"
     exit 1
 fi
 
@@ -19,6 +19,7 @@ TARGET_HOST="$2"
 REPO_URL="$3"
 CLIENT_NAME="${4:-default}"
 CERT_DIR="${5:-}"
+PARALLEL_SOCKETS="${6:-4}"
 
 # Parse server host and port
 SERVER_HOSTNAME="${SERVER_HOST%%:*}"
@@ -59,12 +60,18 @@ else
 fi
 PLIST_PATH="$HOME/Library/LaunchAgents/${LAUNCH_LABEL}.plist"
 
+if ! [[ "$PARALLEL_SOCKETS" =~ ^[0-9]+$ ]] || [ "$PARALLEL_SOCKETS" -lt 1 ] || [ "$PARALLEL_SOCKETS" -gt 32 ]; then
+    echo "Error: PARALLEL_SOCKETS must be an integer from 1 to 32."
+    exit 1
+fi
+
 echo "Starting setup for OKProxy Client on macOS..."
 echo "App Directory: $APP_DIR"
 echo "Server: $SERVER_HOSTNAME:$SERVER_PORT"
 echo "Target: $TARGET_HOSTNAME:$TARGET_PORT"
 echo "Repository: $REPO_URL"
 echo "Client name: $SAFE_CLIENT_NAME"
+echo "Parallel sockets per interface: $PARALLEL_SOCKETS"
 echo "Cert directory: $CERT_DIR"
 
 # 1. Check for and install Node.js if needed
@@ -295,6 +302,8 @@ cat > "$PLIST_PATH" <<EOF
         <string>${SERVER_HOSTNAME}:${SERVER_PORT}</string>
         <string>--target</string>
         <string>${TARGET_HOSTNAME}:${TARGET_PORT}</string>
+        <string>--parallel-sockets</string>
+        <string>${PARALLEL_SOCKETS}</string>
         <string>--cert</string>
         <string>${CLIENT_CERT}</string>
         <string>--key</string>
@@ -334,6 +343,8 @@ cat > "$PLIST_PATH" <<EOF
         <string>production</string>
         <key>MULTIPATH_ENABLED</key>
         <string>true</string>
+        <key>OKPROXY_PARALLEL_SOCKETS</key>
+        <string>${PARALLEL_SOCKETS}</string>
     </dict>
 </dict>
 </plist>
