@@ -60,7 +60,6 @@ function filterWebSocketHeaders(headers) {
 const MAX_WS_BUFFER_SIZE = 16 * 1024 * 1024;
 const DEFAULT_TARGET_TIMEOUT = 30000;
 const DEFAULT_TARGET_KEEPALIVE_TIMEOUT = 60 * 60 * 1000;
-const LOG_VALUE_MAX_LENGTH = 200;
 
 function normalizeTargetTimeout(value) {
   if (value === undefined || value === null) return DEFAULT_TARGET_TIMEOUT;
@@ -74,42 +73,6 @@ function normalizeNonNegativeInteger(value, fallback) {
   const parsed = Number(value);
   if (!Number.isFinite(parsed) || parsed < 0) return fallback;
   return Math.floor(parsed);
-}
-
-function truncateForLog(value, maxLength = LOG_VALUE_MAX_LENGTH) {
-  const str = String(value ?? '');
-  return str.length > maxLength ? `${str.slice(0, maxLength)}…` : str;
-}
-
-function createTimingLog(scope, details = {}, initialMark = 'tunnel_request_received') {
-  const startedAt = process.hrtime.bigint();
-  const marks = new Map([[initialMark, 0]]);
-  let logged = false;
-
-  function elapsedMs() {
-    return Number(process.hrtime.bigint() - startedAt) / 1e6;
-  }
-
-  function mark(name) {
-    if (!marks.has(name)) marks.set(name, elapsedMs());
-  }
-
-  function log(outcome = 'done') {
-    if (logged) return;
-    logged = true;
-    mark('total');
-
-    const detailText = Object.entries(details)
-      .map(([key, value]) => `${key}=${JSON.stringify(truncateForLog(value))}`)
-      .join(' ');
-    const markText = [...marks.entries()]
-      .map(([key, ms]) => `${key}=${ms.toFixed(1)}ms`)
-      .join(' ');
-
-    console.log(`[TIMING] ${scope} outcome=${outcome} ${detailText} ${markText}`);
-  }
-
-  return { mark, log };
 }
 
 function waitForConnectionDrain(connection, callback, streamId = null) {
@@ -282,13 +245,6 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
         connection.setStreamMode(streamId, { singleFlow });
       }
 
-      const timing = createTimingLog('client-ws', {
-        stream: streamId,
-        method: upgradeInfo.method,
-        path: upgradeInfo.path,
-        target: `${targetHost}:${targetPort}`
-      }, 'tunnel_upgrade_received');
-
       const proxyHeaders = filterWebSocketHeaders(upgradeInfo.headers);
       proxyHeaders.host = preserveHost && upgradeInfo.publicHost ? upgradeInfo.publicHost : `${targetHost}:${targetPort}`;
 
@@ -307,22 +263,10 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
         agent: targetAgent
       });
 
-      proxyReq.on('socket', (socket) => {
-        timing.mark('target_socket_assigned');
-        if (socket.connecting) {
-          socket.once('connect', () => timing.mark('target_connected'));
-        } else {
-          if (proxyReq.reusedSocket) timing.mark('target_socket_reused');
-          timing.mark('target_connected');
-        }
-      });
-
       let upgradeTimeoutTriggered = false;
       if (targetTimeout > 0) {
         proxyReq.setTimeout(targetTimeout, () => {
           upgradeTimeoutTriggered = true;
-          timing.mark('target_upgrade_timeout');
-          timing.log('timeout');
           proxyReq.destroy();
           connection.write(encodeFrame(streamId, FrameType.ERROR, Buffer.from('Upgrade timeout')));
           cleanup(false);
@@ -359,14 +303,12 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
           connection.clearStreamMode(streamId);
         }
 
-        timing.log(sendFin ? 'closed' : 'failed');
       }
 
       wsState.cleanup = cleanup;
       activeWebSockets.set(streamId, wsState);
 
       proxyReq.on('upgrade', (proxyRes, proxySocket, proxyHead) => {
-        timing.mark('target_upgrade_headers');
         wsState.socket = proxySocket;
 
         const responseHeaders = {
@@ -411,13 +353,7 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
           proxySocket.resume();
         }
 
-        let firstTargetByte = false;
-
         function processTargetData(chunk) {
-          if (!firstTargetByte && chunk.length > 0) {
-            firstTargetByte = true;
-            timing.mark('first_byte_from_target');
-          }
           if (buffer.length + chunk.length > MAX_WS_BUFFER_SIZE) {
             console.error('WebSocket buffer overflow - destroying connection');
             cleanup();
@@ -499,7 +435,6 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
 
       proxyReq.on('error', (err) => {
         if (upgradeTimeoutTriggered) return;
-        timing.log('upgrade_error');
         console.error(`[CLIENT WS ERROR] WebSocket upgrade failed for ${upgradeInfo.path}:`, err.message, `(code: ${err.code || 'none'})`);
         const errorDetail = err.code ? `Upgrade failed: ${err.code}` : 'Upgrade failed';
         connection.write(encodeFrame(streamId, FrameType.ERROR, Buffer.from(errorDetail)));
@@ -524,13 +459,6 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
       if (typeof connection.setStreamMode === 'function') {
         connection.setStreamMode(streamId, { singleFlow });
       }
-
-      const timing = createTimingLog('client-http', {
-        stream: streamId,
-        method: reqInfo.method,
-        path: reqInfo.path,
-        target: `${targetHost}:${targetPort}`
-      });
 
       const proxyHeaders = filterRequestHeaders(reqInfo.headers);
       proxyHeaders.host = preserveHost && reqInfo.publicHost ? reqInfo.publicHost : `${targetHost}:${targetPort}`;
@@ -572,7 +500,6 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
 
         streamState.responseStarted = true;
         streamState.clearTargetTimer();
-        timing.mark('target_headers');
 
         const filteredHeaders = filterRequestHeaders(proxyRes.headers);
 
@@ -580,21 +507,14 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
           status: proxyRes.statusCode,
           headers: filteredHeaders
         })));
-        timing.mark('tunnel_response_headers_sent');
 
         if (!canWrite) {
           streamState.pauseTargetResponse(proxyRes);
         }
 
         let responseEnded = false;
-        let firstByteFromTarget = false;
 
         proxyRes.on('data', (chunk) => {
-          if (!firstByteFromTarget && chunk.length > 0) {
-            firstByteFromTarget = true;
-            timing.mark('first_byte_from_target');
-          }
-
           let offset = 0;
           let canContinue = true;
           while (offset < chunk.length) {
@@ -614,14 +534,12 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
         proxyRes.on('end', () => {
           responseEnded = true;
           connection.write(encodeFrame(streamId, FrameType.FIN, Buffer.alloc(0)));
-          timing.log('complete');
           streamState.cleanup();
         });
 
         proxyRes.on('close', () => {
           if (!responseEnded && streamState && !streamState.completed) {
             console.error(`[CLIENT ERROR] Target response closed early for ${reqInfo.method} ${reqInfo.path}`);
-            timing.log('target_response_closed');
             connection.write(encodeFrame(streamId, FrameType.ERROR, Buffer.from('Target response closed')));
             streamState.cleanup();
           }
@@ -630,21 +548,10 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
         proxyRes.on('error', (err) => {
           if (streamState && streamState.completed) return;
           console.error(`[CLIENT ERROR] Target response error for ${reqInfo.method} ${reqInfo.path}:`, err.message, `(code: ${err.code || 'none'})`);
-          timing.log('target_response_error');
           const errorDetail = err.code ? `Target error: ${err.code}` : 'Target error';
           connection.write(encodeFrame(streamId, FrameType.ERROR, Buffer.from(errorDetail)));
           if (streamState) streamState.cleanup();
         });
-      });
-
-      proxyReq.on('socket', (socket) => {
-        timing.mark('target_socket_assigned');
-        if (socket.connecting) {
-          socket.once('connect', () => timing.mark('target_connected'));
-        } else {
-          if (proxyReq.reusedSocket) timing.mark('target_socket_reused');
-          timing.mark('target_connected');
-        }
       });
 
       streamState = {
@@ -676,8 +583,6 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
         timeoutTarget() {
           if (this.completed) return;
           this.timedOut = true;
-          timing.mark('target_timeout');
-          timing.log('target_timeout');
           console.error(`[CLIENT TIMEOUT] Target response timeout after ${targetTimeout}ms for ${reqInfo.method} ${reqInfo.path}`);
 
           if (this.responseStarted) {
@@ -744,7 +649,6 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
         if (streamState && (streamState.completed || streamState.timedOut)) return;
 
         console.error(`[CLIENT ERROR] Target error for ${reqInfo.method} ${reqInfo.path}:`, err.message, `(code: ${err.code || 'none'})`);
-        timing.log('target_error');
         if (err.code === 'ECONNREFUSED') {
           sendPlainResponse(502, 'Target service not available');
         } else {
